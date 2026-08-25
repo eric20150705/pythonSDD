@@ -110,6 +110,32 @@ def create_bricks():
             bricks.append(Brick(x, y, brick_width, brick_height, color))
     return bricks
 
+def bounce_ball(ball, target_rect):
+    overlap = {
+        "left": ball.rect.right - target_rect.left,
+        "right": target_rect.right - ball.rect.left,
+        "top": ball.rect.bottom - target_rect.top,
+        "bottom": target_rect.bottom - ball.rect.top,
+    }
+    collision_side = min(overlap, key=overlap.get)
+
+    if collision_side in ["left", "right"]:
+        ball.velocity.x *= -1
+    elif collision_side in ["top", "bottom"]:
+        ball.velocity.y *= -1
+def handle_collision(ball, paddle, bricks):
+    if ball.velocity.y > 0 and ball.rect.colliderect(paddle.rect):
+        ball.rect.bottom = paddle.rect.top
+        ball.position.y = ball.rect.centery
+        ball.velocity.y *= -abs(ball.velocity.y)
+
+        offset = (ball.rect.centerx - paddle.rect.centerx) / (paddle.rect.width / 2)
+        ball.velocity.x = 6 * offset
+    for brick in bricks:
+        if brick.alive and ball.rect.colliderect(brick.rect):
+            brick.alive = False
+            bounce_ball(ball, brick.rect)
+            break  # 只處理一個磚塊碰撞
 
 ################################初始化設定#################################
 pygame.init()
@@ -141,6 +167,7 @@ while running:
     keys = pygame.key.get_pressed()
     paddle.update(keys)
     ball.update(paddle)
+    handle_collision(ball, paddle, bricks)
     # 清除畫面
     screen.fill(BACKGROUND)
 
