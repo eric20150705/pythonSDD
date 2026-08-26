@@ -1,9 +1,15 @@
 <!--
 Sync Impact Report
-- Version change: Unversioned scaffold → 1.0.0
-- Modified principles: Five scaffold placeholders → five project-specific principles
-- Added sections: Project Constraints; Development Workflow and Quality Gates
-- Removed sections: None; the scaffold sections were replaced with concrete project guidance
+- Version change: 1.0.0 → 1.1.0
+- Modified principles:
+  - Playable Increment First → Playable Increment First（先完成可玩的最小切片）
+  - Clear Python Fundamentals → Python/Pygame Fundamentals Before Advanced Architecture
+  - Recognizable Game-Loop Responsibilities → Explicit Game-Loop Responsibilities
+  - Verify Before Expanding → Verify Behavior Before Expanding
+  - Safe, Incremental Refactoring → Safe, Incremental Refactoring
+- Added sections: Capability Baseline within Learning Scope and Project Constraints;
+  explicit state invariants in Development Workflow and Quality Gates
+- Removed sections: None
 - Follow-up TODOs: None
 -->
 
@@ -11,106 +17,115 @@ Sync Impact Report
 
 ## Core Principles
 
-### I. Playable Increment First
+### I. Playable Increment First（先完成可玩的最小切片）
 
-Every feature MUST begin with the smallest playable result that can be seen, controlled,
-or otherwise verified in the game. A feature is complete only when its success condition,
-player input, visible feedback, and failure or boundary behavior are defined. New work MUST
-extend the existing playable game in small steps instead of combining many unverified ideas
-into one large change.
+每個功能 MUST 從最小、可執行且能被玩家觀察的切片開始。切片 MUST 先定義玩家
+輸入、狀態變化、畫面回饋、成功條件，以及邊界或失敗行為。新機制 MUST 一次只
+加入一個主要變化，並在執行中的遊戲確認後，才可與其他效果合併。
 
-Rationale: The project has progressed from basic functions and a window to bricks, a paddle,
-a ball, collisions, power-ups, particles, and win/loss states. Continuing with short vertical
-slices keeps that progress understandable and makes mistakes easier to locate.
+理由：專案已從函式與 Pygame 視窗逐步發展到磚塊、底板、球、碰撞、計分、生命、
+特殊磚塊、粒子、煙火與勝負狀態。垂直切片能讓每次修改的因果關係保持清楚。
 
-### II. Clear Python Fundamentals
+### II. Python/Pygame Fundamentals Before Advanced Architecture
 
-Project code MUST favor readable variables, named constants, small functions, and simple
-classes with one understandable responsibility. A new abstraction MUST solve a concrete
-problem in the current feature; patterns, frameworks, and indirection MUST NOT be added only
-to appear sophisticated. Existing code MAY be improved gradually, but a feature MUST NOT be
-blocked by a broad rewrite that is unrelated to its behavior.
+程式碼 MUST 優先使用可讀的名稱、集中管理的可調整常數、小型函式，以及讓相關
+狀態與行為放在一起的簡單類別。串列、字典、迴圈、property、pygame.Rect、
+pygame.Vector2、計時器、random 與 math 等技術可直接使用，因為它們已在專案中
+被實際運用。設計模式、型別系統、框架、額外套件或其他進階抽象 MUST 只有在目前
+功能有明確需求時才導入，且計畫 MUST 說明它解決的問題與使用方式。
 
-Rationale: The current code demonstrates effective use of Python fundamentals and Pygame
-objects. The project should strengthen those skills before requiring advanced architecture.
+理由：目前程式碼顯示已具備基礎至初中階的 Python/Pygame 實作能力，但尚未建立
+測試基礎設施、型別註記或多模組架構。憲章必須讓能力逐步成長，不能用超出目前
+需求的架構取代對遊戲行為的理解。
 
-### III. Recognizable Game-Loop Responsibilities
+### III. Explicit Game-Loop Responsibilities
 
-The main loop MUST keep event handling, game-state updates, collision and effect rules, and
-rendering in clearly identifiable sections or functions. Classes MUST keep their own state
-and behavior together where that improves clarity. A change that adds a new game rule MUST
-identify where the rule is updated, how it affects state, and how the player sees the result.
+主迴圈 MUST 保持輸入與事件、狀態更新、碰撞與規則、計時與特效、繪圖、畫面更新
+等階段可被辨識。新增遊戲規則 MUST 指出狀態由誰擁有、在哪個更新階段改變，以及
+玩家如何看見結果。Brick、Paddle、Ball、Explosion、Firework 等物件 MUST 將
+自己的資料與直接行為放在同一個類別中；跨物件規則 SHOULD 放在目的單一的函式。
+學習階段 MAY 保留單檔主程式，但新增大型系統前 MUST 在計畫中指出可抽出的責任
+邊界。
 
-Rationale: The project already uses Pygame's event loop and classes such as `Brick`, `Paddle`,
-and `Ball`. Making responsibilities explicit will allow more features without losing control
-of the program as the game grows.
+理由：目前程式已能處理多球、碰撞、磚塊效果、粒子生命週期、煙火與勝負狀態。
+明確的責任邊界可以在不要求一次重寫的前提下，控制單檔遊戲持續成長的複雜度。
 
-### IV. Verify Before Expanding
+### IV. Verify Behavior Before Expanding
 
-Before a feature is considered complete, the author MUST run a syntax or import check for the
-changed Python files and perform a manual smoke test of the affected controls and game states.
-Collision, scoring, timing, and other repeatable rules SHOULD have small automated checks once
-they are separated from rendering. A failed check MUST be fixed or recorded as an explicit
-known limitation before the next feature is started.
+功能完成前，受影響的 Python 檔案 MUST 通過語法或 AST 解析檢查，受影響的遊戲
+路徑 MUST 完成手動 smoke test。測試 MUST 包含一條正常流程，以及至少一個相關
+的邊界或失敗流程，例如離開遊戲、底板移動邊界、發射球、球遺失、磚塊碰撞、
+遊戲勝利或遊戲結束。可從 Pygame 繪圖中分離的重複規則 SHOULD 使用標準庫
+unittest 或其他已存在的測試工具建立自動化檢查。無法執行的檢查 MUST 記錄原因
+與已知限制，不能默默略過。
 
-Rationale: The project is currently visual and interactive, so manual play is essential, but
-repeatable checks will become increasingly valuable as the rules and effects multiply.
+理由：目前專案以視覺與互動行為為主，手動操作仍是必要驗證；碰撞、計分、計時器
+與狀態轉換則適合逐步分離，讓自動化驗證能隨能力成長。
 
 ### V. Safe, Incremental Refactoring
 
-Refactoring MUST preserve a runnable version of the game and MUST be kept separate from new
-gameplay work unless the feature cannot be implemented safely without it. Before moving logic,
-the current behavior MUST be recorded through a smoke-test checklist or automated check. When
-a file contains several unrelated responsibilities, the next suitable change SHOULD extract
-one responsibility at a time rather than rewrite the whole project.
+重構 MUST 保留可執行的遊戲里程碑，且 MUST 與新玩法分開，除非沒有重構就無法
+安全完成該功能。移動邏輯前 MUST 先用 smoke test 或自動化檢查記錄既有行為。
+當檔案同時包含輸入、更新、碰撞、特效與繪圖時，後續工作 MUST 一次只抽出一個
+責任；不得以大範圍重寫取代可追蹤的學習步驟。day1 與 day2 的歷史練習 MAY
+保留原有形式，不得為了表面一致而全部改寫。
 
-Rationale: D2 has grown into a substantial single-file game. Small extractions reduce risk and
-build maintainable habits without dismissing the working code that already exists.
+理由：day2/prj05.py 已形成大型單檔遊戲。小幅抽取能建立可維護習慣，也能保護
+目前已經能執行的功能與學習成果。
 
-## Project Constraints
+## Learning Scope and Project Constraints
 
-- The project MUST use Python and Pygame Community Edition as its primary runtime stack.
-- Runtime dependencies MUST be declared in `requirements.txt`; a new dependency MUST include
-  a short reason in the relevant plan or project documentation.
-- Existing gameplay targets a 60 FPS loop unless a feature explicitly defines and verifies a
-  different timing model.
-- New features MUST remain understandable to a learner who can read functions, classes,
-  constants, lists, dictionaries, and basic object state. More advanced techniques MAY be
-  introduced when they solve a demonstrated problem and are explained in the plan.
-- Temporary editor output, generated caches, credentials, and machine-specific files MUST NOT
-  be treated as project source or committed as part of a feature.
+本憲章根據目前專案程式碼建立以下能力基線。開發者已能獨立處理函式、參數與
+回傳值、條件與迴圈、串列與字典、常數、簡單類別與方法、Pygame 事件迴圈、
+鍵盤控制、Rect 碰撞、Vector2 移動、計時器、隨機效果，以及基本遊戲狀態。
+測試檔、型別註記、多模組架構與正式打包目前是逐步建立的學習目標，不是要求
+立即全面重寫的前置條件。
+
+- 專案 MUST 使用 Python 與 Pygame Community Edition 作為主要執行環境；執行時
+  依賴 MUST 登記在 requirements.txt，新增依賴 MUST 說明必要原因。
+- 目前遊戲以 60 FPS 的 frame-based timing 為基準。改用 delta time 或其他
+  timing 模型前，計畫 MUST 說明原因，並驗證速度、計時器與碰撞行為沒有退化。
+- 學習練習 MAY 以單檔與頂層主迴圈保存。新增的可變全域狀態 MUST 有清楚名稱，
+  並在計畫或註解中說明其生命週期；當責任邊界已明確時，新增功能 MUST 優先
+  考慮抽成函式或類別。
+- 新增識別字 MUST 使用正確拼字且能表達用途；既有名稱只有在不擴大修改範圍時
+  才修正。註解或 docstring MAY 使用中文，但 MUST 說明意圖或規則，而不是重複
+  程式碼表面語法。
+- 暫存編輯器輸出、bytecode cache、虛擬環境、憑證與機器專屬檔案 MUST NOT
+  視為專案原始碼或納入功能提交。
 
 ## Development Workflow and Quality Gates
 
-1. Describe the player-facing behavior, controls, states, and success criteria before coding.
-2. Break the work into one playable slice and identify the functions, classes, or constants it
-   will touch.
-3. Implement the smallest change that satisfies the slice, keeping input, update, collision,
-   and drawing responsibilities recognizable.
-4. Run `python -m compileall` on the affected project directories and manually exercise the
-   changed path, including at least one boundary or failure case.
-5. Add or update a focused automated check when the feature contains repeatable non-visual
-   rules such as scoring, collision outcomes, timers, or state transitions.
-6. Review the change against this constitution before starting the next slice. Any exception
-   MUST be documented with its reason and the behavior it protects.
+1. 在寫程式前，先記錄玩家行為、控制方式、狀態、畫面回饋、成功條件與失敗或
+   邊界條件。
+2. 從現有類別、函式與常數中選出一個可完成的垂直切片，並列出預計修改的責任。
+3. 以最小修改完成切片，保持輸入、更新、碰撞、特效與繪圖的責任順序可辨識。
+4. 對受影響的 Python 目錄執行語法檢查，並啟動相關腳本完成手動 smoke test。
+   測試結果 MUST 記錄在功能筆記、計畫或提交說明中。
+5. 含有重複規則的功能 MUST 驗證下列適用的不變量：
+   - 活躍球數不得超過 MAX_BALLS。
+   - 生命值只可因明確的失球或生命效果改變，且遊戲結束後不得繼續扣減。
+   - 磚塊分數 MUST 只在磚塊真正被摧毀時增加一次。
+   - 計時器 MUST 遞減至零，不得因更新流程產生不受控的負值或永久效果。
+   - game_over 與 game_won MUST 不可同時為真。
+6. 當碰撞、計分、計時器或狀態轉換已能與繪圖分離時，MUST 增加一個聚焦的
+   自動化檢查；檢查可使用 Python 標準庫，不得為了測試而不必要地擴增依賴。
+7. 在開始下一個切片前，依本憲章檢查複雜度、驗證結果與已知限制。任何例外
+   MUST 記錄被跳過的規則、原因、保護的行為與後續處理方式。
 
 ## Governance
 
-This constitution defines the project's development priorities and takes precedence over
-convenience-based coding habits. Feature specifications, plans, task lists, and code reviews
-MUST be checked against these principles. When a requirement conflicts with this constitution,
-the conflict MUST be resolved explicitly in the relevant design artifact before implementation.
+本憲章定義專案的開發優先順序，優先於方便但未經說明的程式習慣。功能規格、
+計畫、任務清單與程式碼檢查 MUST 對照本憲章。若需求與憲章衝突，實作前 MUST
+在相關設計文件中明確記錄衝突、選擇與影響。
 
-The project owner may amend this constitution when the project's learning goals, technology,
-or maintenance needs change. Each amendment MUST update the Sync Impact Report, explain the
-reason for the change, update the semantic version, and set the Last Amended date. An amendment
-that removes or redefines a principle is a MAJOR version; a new principle or materially wider
-requirement is a MINOR version; wording clarifications and non-semantic corrections are a PATCH
-version.
+專案擁有者可依學習目標、技術選擇或維護需求修訂本憲章。每次修訂 MUST 更新
+檔案最上方的 Sync Impact Report、說明變更原因、更新語意版本與 Last Amended
+日期。移除或重新定義核心原則是 MAJOR；新增原則、章節或大幅擴充規範是 MINOR；
+澄清文字、修正拼字或不改變治理意義的調整是 PATCH。
 
-Every feature review MUST confirm that the implementation has a defined playable outcome,
-passes the applicable syntax and smoke checks, and records any accepted limitation. The
-constitution MUST be revisited when a feature repeatedly violates a rule or when the rule no
-longer supports the project's learning goals; code MUST NOT silently bypass it.
+每個功能檢查 MUST 確認已有可觀察的遊戲結果、完成適用的語法與 smoke test、
+驗證相關狀態不變量，並記錄任何限制。若某條規則被反覆違反，或已不再支持
+學習目標，必須修訂憲章或在設計文件中提出例外；程式碼不得無聲繞過規則。
 
-**Version**: 1.0.0 | **Ratified**: 2026-08-26 | **Last Amended**: 2026-08-26
+**Version**: 1.1.0 | **Ratified**: 2026-08-26 | **Last Amended**: 2026-08-26
