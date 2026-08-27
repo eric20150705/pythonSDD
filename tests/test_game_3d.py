@@ -644,6 +644,18 @@ class FeatureFoundationTests(PygameTestCase):
         self.assertEqual(session.bullets, [])
         self.assertIsNone(session.pull_action)
 
+    def test_collision_query_is_local_but_keeps_nearby_buildings(self) -> None:
+        session = self.make_session(9002)
+        near = self.make_segment_building("near:0:0:0", game_3d.Vector3(0, 0, 4))
+        far = self.make_segment_building("far:0:0:0", game_3d.Vector3(100, 0, 0))
+        session.world.active_chunks.clear()
+        session.world.active_chunks[(0, 0)] = game_3d.CityChunk((0, 0), 1, [near, far])
+
+        entries = game_3d.nearby_static_collision_entries(session)
+        entry_ids = {segment.segment_id for _, segment, _ in entries}
+        self.assertIn(near.all_segments()[0].segment_id, entry_ids)
+        self.assertNotIn(far.all_segments()[0].segment_id, entry_ids)
+
     def test_transient_reset_does_not_clear_intact_segment_damage(self) -> None:
         session = self.make_session()
         building = self.make_segment_building("foundation:0:0:0")
@@ -1192,6 +1204,14 @@ class CollapseRegressionTests(PygameTestCase):
 
 
 class HUDFeatureTests(PygameTestCase):
+    def test_hud_recovers_after_pygame_font_module_restart(self) -> None:
+        session = self.make_session(9799)
+        surface = self.make_surface()
+        game_3d.draw_hud(surface, session)
+        pygame.font.quit()
+        pygame.font.init()
+        game_3d.draw_hud(surface, session)
+
     def test_hud_exposes_weapon_mode_target_progress_and_completion(self) -> None:
         session = self.make_session(9800)
         building = self.make_segment_building("hud:0:0:0")

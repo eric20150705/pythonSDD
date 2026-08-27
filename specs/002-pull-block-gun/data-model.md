@@ -8,7 +8,7 @@
 - 抽取觸發距離為 `PULL_TRIGGER_PIXELS = 24` 畫面像素，成功抽取預覽為 `PULL_ANIMATION_FRAMES = 10` 幀。
 - 子彈以 `BULLET_SPEED = 1.6` 世界單位／幀移動，最長 `BULLET_LIFETIME_FRAMES = 45` 幀或 `BULLET_MAX_DISTANCE = 60.0` 世界單位。
 - 連射間隔為 `FIRE_INTERVAL_FRAMES = 6`，每個完整分段需要 `BULLET_HITS_TO_BREAK = 10` 次有效命中。
-- 建築分段於 `RESPAWN_FRAMES = 1800` 幀後進入既有支撐感知的重生流程；固定 60 FPS 下約為 30 秒。
+- 建築分段於 `RESPAWN_FRAMES = 1800` 幀後進入既有支撐感知的重生流程；固定 60 FPS 下等同 30 秒。
 - 子彈集合最多 `MAX_BULLETS = 256`；效果與碎片沿用既有 `MAX_EFFECTS = 256`、`MAX_DEBRIS = 512` 上限。
 - 背景採固定淺藍色 `SKY_COLOR = (170, 220, 245)`；遠景渲染距離為 180，細節距離為 110 世界單位。
 

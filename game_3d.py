@@ -8,6 +8,7 @@ headless ``--self-test`` command.
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import math
 import random
@@ -55,6 +56,52 @@ DETAIL_RENDER_DISTANCE = 110.0
 MAX_RENDER_SEGMENTS = 120
 MAX_RENDER_SILHOUETTES = 128
 HUD_TARGET_REFRESH_FRAMES = 4
+HUD_TEXT_CACHE_LIMIT = 128
+
+_HUD_FONT_CACHE: dict[int, pygame.font.Font] = {}
+_HUD_TEXT_CACHE: OrderedDict[
+    tuple[int, str, tuple[int, int, int]], pygame.Surface
+] = OrderedDict()
+
+
+def _hud_font(size: int) -> pygame.font.Font:
+    """Reuse HUD font objects while remaining safe after ``pygame.font.quit``."""
+
+    if not pygame.font.get_init():
+        pygame.font.init()
+        _HUD_FONT_CACHE.clear()
+        _HUD_TEXT_CACHE.clear()
+    font = _HUD_FONT_CACHE.get(size)
+    if font is not None:
+        try:
+            font.get_height()
+        except pygame.error:
+            _HUD_FONT_CACHE.clear()
+            _HUD_TEXT_CACHE.clear()
+            font = None
+    if font is None:
+        font = pygame.font.Font(None, size)
+        _HUD_FONT_CACHE[size] = font
+    return font
+
+
+def _hud_text(
+    size: int,
+    text: str,
+    color: tuple[int, int, int],
+) -> pygame.Surface:
+    """Cache a bounded set of immutable HUD text surfaces between frames."""
+
+    key = (size, text, color)
+    cached = _HUD_TEXT_CACHE.get(key)
+    if cached is not None:
+        _HUD_TEXT_CACHE.move_to_end(key)
+        return cached
+    rendered = _hud_font(size).render(text, True, color)
+    _HUD_TEXT_CACHE[key] = rendered
+    if len(_HUD_TEXT_CACHE) > HUD_TEXT_CACHE_LIMIT:
+        _HUD_TEXT_CACHE.popitem(last=False)
+    return rendered
 
 PLAYER_SIZE = pygame.Vector3(0.8, 1.8, 0.8)
 PLAYER_HALF_HEIGHT = PLAYER_SIZE.y / 2.0
@@ -1868,6 +1915,33 @@ def _contacting_segment_entries(
     ]
 
 
+def nearby_static_collision_entries(
+    session: SessionState,
+) -> list[tuple[Building, BuildingSegment, AABB]]:
+    """Build a conservative local collision set around the player.
+
+    Collision resolution only needs buildings that can overlap the player's
+    horizontal footprint during the next fixed step.  The radial broad phase
+    keeps all such buildings while avoiding rebuilding AABBs for the entire
+    active world every frame.
+    """
+
+    player = session.player
+    max_horizontal_step = PLAYER_SPEED + max(
+        abs(player.pending_push.x), abs(player.pending_push.z)
+    )
+    entries: list[tuple[Building, BuildingSegment, AABB]] = []
+    for building in session.world.all_buildings():
+        reach_x = building.width * 0.5 + player.size.x * 0.5 + max_horizontal_step
+        reach_z = building.depth * 0.5 + player.size.z * 0.5 + max_horizontal_step
+        if building.distance_to_xz(player.position) > math.hypot(reach_x, reach_z):
+            continue
+        for segment in building.all_segments():
+            if segment.status == INTACT:
+                entries.append((building, segment, segment.aabb(building.origin)))
+    return entries
+
+
 def update_gameplay(
     session: SessionState,
     movement: Vector3,
@@ -1878,10 +1952,7 @@ def update_gameplay(
     session.advance_frame()
     session.world.ensure_active(session.player.position, session.frame)
     was_below_recovery = session.player.position.y < RECOVERY_HEIGHT
-    static_entries = [
-        (building, segment, segment.aabb(building.origin))
-        for building, segment in session.world.static_segments()
-    ]
+    static_entries = nearby_static_collision_entries(session)
     update_player(
         session.player,
         movement,
@@ -2297,28 +2368,27 @@ def camera_shake_offset(session: SessionState) -> Vector3:
 def draw_hud(surface: pygame.Surface, session: SessionState) -> None:
     """Draw weapon mode, target progress, demolition count and respawn status."""
 
-    if not pygame.font.get_init():
-        pygame.font.init()
-    font = pygame.font.Font(None, 24)
-    title_font = pygame.font.Font(None, 32)
     width, height = surface.get_size()
     panel = pygame.Surface((width, 116), pygame.SRCALPHA)
     panel.fill((4, 8, 20, 205))
     surface.blit(panel, (0, 0))
-    title = title_font.render("NEON CITY", True, (90, 240, 255))
-    count = font.render(
-        f"Unique demolished: {session.hud.destroyed_count}", True, (235, 245, 255)
+    title = _hud_text(32, "NEON CITY", (90, 240, 255))
+    count = _hud_text(
+        24,
+        f"Unique demolished: {session.hud.destroyed_count}",
+        (235, 245, 255),
     )
-    weapon = font.render(
+    weapon_color = (170, 255, 200) if session.hud.weapon_state == "EQUIPPED" else (235, 245, 255)
+    weapon = _hud_text(
+        24,
         f"Weapon: {session.hud.weapon_state}  {session.hud.mode_hint}",
-        True,
-        (170, 255, 200) if session.hud.weapon_state == "EQUIPPED" else (235, 245, 255),
+        weapon_color,
     )
     target_name = "none" if session.hud.target_segment is None else str(session.hud.target_segment)
     target_hits = "--" if session.hud.target_hits is None else str(session.hud.target_hits)
-    target = font.render(
+    target = _hud_text(
+        24,
         f"Target: {target_name}  Hits: {target_hits}/{BULLET_HITS_TO_BREAK}",
-        True,
         (255, 220, 120),
     )
     respawn_text = (
@@ -2326,13 +2396,13 @@ def draw_hud(surface: pygame.Surface, session: SessionState) -> None:
         if session.hud.respawn_remaining is None
         else f"Respawn: {session.hud.respawn_remaining}s"
     )
-    respawn = font.render(respawn_text, True, (210, 220, 240))
+    respawn = _hud_text(24, respawn_text, (210, 220, 240))
     surface.blit(title, (16, 8))
     surface.blit(count, (170, 12))
     surface.blit(weapon, (16, 40))
     surface.blit(target, (16, 66))
     surface.blit(respawn, (650, 66))
-    hint = font.render(session.hud.control_hint, True, (175, 190, 210))
+    hint = _hud_text(24, session.hud.control_hint, (175, 190, 210))
     surface.blit(hint, (16, max(0, height - 28)))
 
 
