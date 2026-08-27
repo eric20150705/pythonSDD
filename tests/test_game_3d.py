@@ -574,6 +574,10 @@ class SessionLifecycleTests(PygameTestCase):
         self.assertEqual(new_session.camera.yaw, 0.0)
         self.assertFalse(new_session.camera.orbiting)
 
+    def test_cli_converts_keyboard_interrupt_to_standard_exit_code(self) -> None:
+        with patch.object(game_3d, "main", side_effect=KeyboardInterrupt):
+            self.assertEqual(game_3d.run_cli(["game_3d.py"]), 130)
+
     def test_escape_quit_and_input_release_clean_up_session_controls(self) -> None:
         session = game_3d.create_session(world_seed=333)
         game_3d.handle_game_event(

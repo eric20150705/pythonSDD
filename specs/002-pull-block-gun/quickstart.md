@@ -97,7 +97,7 @@ SC-009 通過條件為至少 4/5 的「成功」欄為是。
 - `.venv\Scripts\python.exe -m py_compile game_3d.py`：通過，結束碼 0。
 - `.venv\Scripts\python.exe game_3d.py --self-test`：通過，輸出
   `NEON CITY self-test: all core rules ok`。
-- `.venv\Scripts\python.exe -m unittest discover -s tests -v`：通過，53 項測試全部成功。
+- `.venv\Scripts\python.exe -m unittest discover -s tests -v`：通過，54 項測試全部成功。
 - 功能 002 聚焦測試（基礎狀態、抽取、槍械／子彈、傷害、遠景／渲染、倒塌與 HUD）：
   23 項測試全部成功。
 - 自動化案例已覆蓋站立碰撞、抽取取消與三方向游標跟隨、10 幀抽取完成、立即射擊與每
@@ -106,6 +106,8 @@ SC-009 通過條件為至少 4/5 的「成功」欄為是。
   自動重建快取，並以玩家周邊廣域碰撞篩選限制碰撞查詢；不改變互動規則。
 - 程式碼審查後以 1280x720 無視窗 Surface 暖機，再執行 120 個主迴圈幀得到約 65.7 FPS；
   實際 FPS 仍會依桌面硬體與顯示環境變動。
+- 新增命令列中斷回歸測試：以 `Ctrl+C` 停止遊戲時會清理 Pygame 並以退出碼 `130` 結束，
+  不再顯示未處理的 traceback。
 
 2026-08-27 使用者回報已完成快速入門所列人工 HUD 驗收、完整手動冒煙測試與 15 分鐘
 有界執行檢查，抽取、射擊、站立碰撞、遠景、失焦、`Esc`、倒塌與重生均未發現問題；

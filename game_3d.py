@@ -2537,5 +2537,15 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def run_cli(argv: list[str] | None = None) -> int:
+    """Run the command-line entry point without exposing a Ctrl+C traceback."""
+
+    try:
+        return main(argv)
+    except KeyboardInterrupt:
+        pygame.quit()
+        return 130
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_cli())
