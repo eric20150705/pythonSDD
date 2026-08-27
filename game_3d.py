@@ -8,6 +8,7 @@ headless ``--self-test`` command.
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import math
 import random
@@ -38,10 +39,69 @@ MAX_DEBRIS = 512
 MAX_EFFECTS = 256
 RESPAWN_FRAMES = 1800
 RECOVERY_HEIGHT = -20.0
-RENDER_DISTANCE = 110.0
-DETAIL_RENDER_DISTANCE = 80.0
+PULL_TRIGGER_PIXELS = 24.0
+PULL_ANIMATION_FRAMES = 10
+PULL_OFFSET_DISTANCE = 0.9
+BULLET_SPEED = 1.6
+BULLET_LIFETIME_FRAMES = 45
+BULLET_MAX_DISTANCE = 60.0
+FIRE_INTERVAL_FRAMES = 6
+BULLET_HITS_TO_BREAK = 10
+MAX_BULLETS = 256
+SKY_COLOR = (170, 220, 245)
+VISIBLE_CHUNK_RADIUS = 2
+MAX_VISIBLE_CHUNKS = 25
+RENDER_DISTANCE = 180.0
+DETAIL_RENDER_DISTANCE = 110.0
 MAX_RENDER_SEGMENTS = 120
+MAX_RENDER_SILHOUETTES = 128
 HUD_TARGET_REFRESH_FRAMES = 4
+HUD_TEXT_CACHE_LIMIT = 128
+
+_HUD_FONT_CACHE: dict[int, pygame.font.Font] = {}
+_HUD_TEXT_CACHE: OrderedDict[
+    tuple[int, str, tuple[int, int, int]], pygame.Surface
+] = OrderedDict()
+
+
+def _hud_font(size: int) -> pygame.font.Font:
+    """Reuse HUD font objects while remaining safe after ``pygame.font.quit``."""
+
+    if not pygame.font.get_init():
+        pygame.font.init()
+        _HUD_FONT_CACHE.clear()
+        _HUD_TEXT_CACHE.clear()
+    font = _HUD_FONT_CACHE.get(size)
+    if font is not None:
+        try:
+            font.get_height()
+        except pygame.error:
+            _HUD_FONT_CACHE.clear()
+            _HUD_TEXT_CACHE.clear()
+            font = None
+    if font is None:
+        font = pygame.font.Font(None, size)
+        _HUD_FONT_CACHE[size] = font
+    return font
+
+
+def _hud_text(
+    size: int,
+    text: str,
+    color: tuple[int, int, int],
+) -> pygame.Surface:
+    """Cache a bounded set of immutable HUD text surfaces between frames."""
+
+    key = (size, text, color)
+    cached = _HUD_TEXT_CACHE.get(key)
+    if cached is not None:
+        _HUD_TEXT_CACHE.move_to_end(key)
+        return cached
+    rendered = _hud_font(size).render(text, True, color)
+    _HUD_TEXT_CACHE[key] = rendered
+    if len(_HUD_TEXT_CACHE) > HUD_TEXT_CACHE_LIMIT:
+        _HUD_TEXT_CACHE.popitem(last=False)
+    return rendered
 
 PLAYER_SIZE = pygame.Vector3(0.8, 1.8, 0.8)
 PLAYER_HALF_HEIGHT = PLAYER_SIZE.y / 2.0
@@ -243,6 +303,9 @@ class Player:
     grounded: bool = True
     last_safe_position: Vector3 | None = None
     contact_cooldowns: dict[object, int] = field(default_factory=dict)
+    has_gun: bool = True
+    gun_equipped: bool = False
+    fire_cooldown_frames: int = 0
     slow_until_frame: int = 0
     pending_push: Vector3 = field(default_factory=Vector3)
     size: Vector3 = field(default_factory=lambda: Vector3(PLAYER_SIZE))
@@ -572,6 +635,7 @@ class BuildingSegment:
     destroyed_frame: int | None = None
     respawn_frame: int | None = None
     counted: bool = False
+    bullet_hits: int = 0
 
     def world_position(self, origin: Vector3) -> Vector3:
         return origin + self.local_position
@@ -581,6 +645,29 @@ class BuildingSegment:
 
     def aabb(self, origin: Vector3) -> AABB:
         return self.cuboid(origin).aabb()
+
+
+def stable_segment_key(
+    building: "Building | BuildingSegment | None" = None,
+    segment: BuildingSegment | None = None,
+    segment_id: tuple[object, ...] | None = None,
+) -> tuple[object, ...]:
+    """Return the persistent identity used for damage, counting and respawn."""
+
+    if isinstance(building, BuildingSegment):
+        return building.segment_id
+    if isinstance(building, tuple):
+        return building
+    if segment is not None:
+        return segment.segment_id
+    if segment_id is not None:
+        return segment_id
+    if building is not None:
+        raise ValueError("a building needs a segment to form a stable key")
+    raise ValueError("a segment or segment_id is required")
+
+
+segment_key = stable_segment_key
 
 
 @dataclass
@@ -819,7 +906,7 @@ class CityChunk:
 
 
 class CityWorld:
-    """Deterministic bounded 3x3 chunk streaming and segment lookup boundary."""
+    """Deterministic active gameplay chunks plus a bounded render-only horizon."""
 
     def __init__(
         self,
@@ -827,16 +914,19 @@ class CityWorld:
         session: "SessionState | None" = None,
         respawn_overrides: dict[tuple[object, ...], RespawnRecord] | None = None,
         counted_segment_keys: set[tuple[object, ...]] | None = None,
+        damage_overrides: dict[tuple[object, ...], int] | None = None,
     ) -> None:
         self.world_seed = int(world_seed)
         self.session = session
         self.active_chunks: dict[tuple[int, int], CityChunk] = {}
+        self.visible_chunks: dict[tuple[int, int], CityChunk] = {}
         self.pending_chunk: CityChunk | None = None
         self.frame = 0
         self.respawn_overrides = respawn_overrides if respawn_overrides is not None else {}
         self.counted_segment_keys = (
             counted_segment_keys if counted_segment_keys is not None else set()
         )
+        self.damage_overrides = damage_overrides if damage_overrides is not None else {}
 
     @property
     def loaded_chunk_count(self) -> int:
@@ -855,10 +945,29 @@ class CityWorld:
             for dx in range(-ACTIVE_CHUNK_RADIUS, ACTIVE_CHUNK_RADIUS + 1)
         ]
 
+    @staticmethod
+    def visible_target_coords(center: tuple[int, int]) -> list[tuple[int, int]]:
+        """Return the bounded 5x5 presentation ring around the player chunk."""
+
+        cx, cz = center
+        return [
+            (cx + dx, cz + dz)
+            for dz in range(-VISIBLE_CHUNK_RADIUS, VISIBLE_CHUNK_RADIUS + 1)
+            for dx in range(-VISIBLE_CHUNK_RADIUS, VISIBLE_CHUNK_RADIUS + 1)
+        ]
+
     def _apply_overrides(self, chunk: CityChunk) -> None:
         for building in chunk.buildings:
             for segment in building.all_segments():
                 segment.counted = segment.segment_id in self.counted_segment_keys
+                segment.bullet_hits = max(0, min(
+                    BULLET_HITS_TO_BREAK - 1,
+                    int(self.damage_overrides.get(segment.segment_id, 0)),
+                ))
+                if segment.bullet_hits:
+                    self.damage_overrides[segment.segment_id] = segment.bullet_hits
+                else:
+                    self.damage_overrides.pop(segment.segment_id, None)
                 record = self.respawn_overrides.get(segment.segment_id)
                 if record is None:
                     continue
@@ -891,7 +1000,7 @@ class CityWorld:
         return chunk
 
     def ensure_active(self, player_position: Vector3, frame: int = 0) -> None:
-        """Keep exactly nine current chunks, with at most one incoming swap buffer."""
+        """Keep the 3x3 gameplay set and bounded 5x5 render set synchronized."""
 
         self.frame = int(frame)
         center = self.chunk_coord(player_position)
@@ -909,6 +1018,25 @@ class CityWorld:
             if coord not in target:
                 self.active_chunks.pop(coord, None)
         self._enforce_density()
+        self._ensure_visible(center)
+
+    def _ensure_visible(self, center: tuple[int, int]) -> None:
+        """Reuse active chunks and deterministically generate only the outer ring."""
+
+        target = set(self.visible_target_coords(center))
+        for coord in sorted(target):
+            active_chunk = self.active_chunks.get(coord)
+            if active_chunk is not None:
+                self.visible_chunks[coord] = active_chunk
+                continue
+            if coord not in self.visible_chunks:
+                self.visible_chunks[coord] = self._generate_chunk(coord)
+        for coord in list(self.visible_chunks):
+            if coord not in target:
+                self.visible_chunks.pop(coord, None)
+        if len(self.visible_chunks) > MAX_VISIBLE_CHUNKS:
+            for coord in sorted(self.visible_chunks)[MAX_VISIBLE_CHUNKS:]:
+                self.visible_chunks.pop(coord, None)
 
     def _enforce_density(self) -> None:
         total = len(self.all_buildings())
@@ -946,6 +1074,24 @@ class CityWorld:
             for coord in sorted(self.active_chunks)
             for building in self.active_chunks[coord].buildings
         ]
+
+    def visible_buildings(self) -> list[Building]:
+        """Return buildings in the bounded render set, including outer silhouettes."""
+
+        return [
+            building
+            for coord in sorted(self.visible_chunks)
+            for building in self.visible_chunks[coord].buildings
+        ]
+
+    def is_active_building(self, building: Building) -> bool:
+        """Return whether a building belongs to the authoritative 3x3 set."""
+
+        return any(
+            building is candidate
+            for chunk in self.active_chunks.values()
+            for candidate in chunk.buildings
+        )
 
     def all_segments(self) -> list[BuildingSegment]:
         return [segment for building in self.all_buildings() for segment in building.all_segments()]
@@ -1015,14 +1161,60 @@ class Debris:
         self.remaining_frames = max(0, self.remaining_frames - 1)
 
 
+PULL_DRAGGING = "DRAGGING"
+PULL_ANIMATING = "ANIMATING"
+
+
+@dataclass
+class PullAction:
+    """One locked grab-and-extract gesture; the preview is render-only."""
+
+    segment_id: tuple[object, ...]
+    start_cursor: tuple[int, int]
+    current_cursor: tuple[int, int]
+    drag_distance: float = 0.0
+    phase: str = PULL_DRAGGING
+    progress: float = 0.0
+    offset_direction: Vector3 = field(default_factory=Vector3)
+    remaining_frames: int | None = None
+
+
+@dataclass
+class Bullet:
+    """A visible fixed-frame projectile with swept collision semantics."""
+
+    position: Vector3
+    velocity: Vector3
+    remaining_frames: int = BULLET_LIFETIME_FRAMES
+    distance_travelled: float = 0.0
+    size: Vector3 = field(default_factory=lambda: Vector3(0.12, 0.12, 0.12))
+
+    def __post_init__(self) -> None:
+        self.position = Vector3(self.position)
+        self.velocity = Vector3(self.velocity)
+        self.remaining_frames = max(0, min(BULLET_LIFETIME_FRAMES, int(self.remaining_frames)))
+        self.distance_travelled = max(0.0, float(self.distance_travelled))
+        self.size = Vector3(self.size)
+
+    @property
+    def active(self) -> bool:
+        return self.remaining_frames > 0 and self.distance_travelled < BULLET_MAX_DISTANCE
+
+
 @dataclass
 class HUDState:
     """Player-facing summary derived from the current session state."""
 
     target_segment: tuple[object, ...] | None = None
+    weapon_state: str = "HOLSTERED"
+    mode_hint: str = "LMB drag to pull"
+    target_hits: int | None = None
+    completion_feedback_frames: int = 0
     destroyed_count: int = 0
     respawn_remaining: int | None = None
-    control_hint: str = "WASD Move  Space Jump  RMB Orbit  LMB Demolish  Esc Quit"
+    control_hint: str = (
+        "WASD Move  Space Jump  RMB Orbit  1 Gun  LMB drag/pull or hold/fire  Esc Quit"
+    )
 
 
 class SessionState:
@@ -1034,18 +1226,25 @@ class SessionState:
         self.player = Player(Vector3(0, PLAYER_HALF_HEIGHT, 0))
         self.camera = Camera()
         self.respawn_overrides: dict[tuple[object, ...], RespawnRecord] = {}
+        self.damage_overrides: dict[tuple[object, ...], int] = {}
         self.counted_segment_keys: set[tuple[object, ...]] = set()
         self.destroyed_count = 0
         self.debris: list[Debris] = []
         self.effects: list[Effect] = []
+        self.bullets: list[Bullet] = []
+        self.pull_action: PullAction | None = None
         self.hud = HUDState()
         self.running = True
         self.held_keys: set[int] = set()
+        self.held_mouse_buttons: set[int] = set()
+        self.cursor_position: tuple[int, int] = (SCREEN_SIZE[0] // 2, SCREEN_SIZE[1] // 2)
+        self.screen_size: tuple[int, int] = SCREEN_SIZE
         self.world = CityWorld(
             self.world_seed,
             session=self,
             respawn_overrides=self.respawn_overrides,
             counted_segment_keys=self.counted_segment_keys,
+            damage_overrides=self.damage_overrides,
         )
         self.world.ensure_active(self.player.position, self.frame)
         self.active_chunks = self.world.active_chunks
@@ -1073,10 +1272,18 @@ class SessionState:
         return effect
 
     def advance_frame(self) -> None:
-        """Advance fixed-frame timers and remove expired effects."""
+        """Advance fixed-frame timers and remove expired transient effects."""
 
         self.frame += 1
         self.world.frame = self.frame
+        self.player.fire_cooldown_frames = max(0, self.player.fire_cooldown_frames - 1)
+        if self.hud.completion_feedback_frames > 0:
+            self.hud.completion_feedback_frames = max(
+                0, self.hud.completion_feedback_frames - 1
+            )
+            if self.hud.completion_feedback_frames == 0:
+                self.hud.target_segment = None
+                self.hud.target_hits = None
         for effect in self.effects:
             effect.remaining_frames = max(0, effect.remaining_frames - 1)
         self.effects[:] = [effect for effect in self.effects if effect.remaining_frames > 0]
@@ -1097,11 +1304,34 @@ class SessionState:
         if len(self.debris) > MAX_DEBRIS:
             self.debris.pop(0)
 
+    def add_bullet(self, bullet: Bullet) -> None:
+        """Prune expired projectiles, then evict oldest active at the hard cap."""
+
+        self.bullets[:] = [item for item in self.bullets if item.active]
+        if len(self.bullets) >= MAX_BULLETS:
+            self.bullets.pop(0)
+        self.bullets.append(bullet)
+
     def clear_input_state(self) -> None:
         """Release transient controls when the window closes or loses focus."""
 
         self.held_keys.clear()
+        self.held_mouse_buttons.clear()
         self.camera.orbiting = False
+        self.pull_action = None
+        self.player.fire_cooldown_frames = 0
+
+
+def respawn_player(session: SessionState) -> None:
+    """Restore the avatar and clear only transient interaction/projectile state."""
+
+    session.player.position = Vector3(session.player.last_safe_position)
+    session.player.velocity = Vector3()
+    session.player.pending_push = Vector3()
+    session.player.grounded = True
+    session.bullets.clear()
+    session.pull_action = None
+    session.clear_input_state()
 
 
 def create_session(world_seed: int | None = None) -> SessionState:
@@ -1135,6 +1365,8 @@ def _mark_segment_falling(
 ) -> bool:
     if segment.status != INTACT:
         return False
+    session.damage_overrides.pop(segment.segment_id, None)
+    segment.bullet_hits = 0
     segment.status = FALLING
     segment.destroyed_frame = session.frame
     segment.respawn_frame = session.frame + RESPAWN_FRAMES
@@ -1242,6 +1474,8 @@ def update_respawns_for_building(session: SessionState, building: Building) -> N
             segment.status = INTACT
             segment.destroyed_frame = None
             segment.respawn_frame = None
+            session.damage_overrides.pop(segment.segment_id, None)
+            segment.bullet_hits = 0
             session.respawn_overrides.pop(segment.segment_id, None)
         else:
             segment.status = PENDING_RESPAWN
@@ -1258,7 +1492,7 @@ def demolish_segment(
     session: SessionState,
     building: Building,
     segment: BuildingSegment | None,
-    cause: str = "click",
+    cause: str = "pull",
     player: Player | None = None,
 ) -> list[BuildingSegment]:
     """Apply direct demolition, then evaluate the building's support graph."""
@@ -1273,6 +1507,343 @@ def demolish_segment(
         changed.append(segment)
     changed.extend(evaluate_support_cascade(session, building))
     return changed
+
+
+def aim_direction_from_cursor(
+    camera: Camera,
+    target: Vector3,
+    cursor: tuple[float, float],
+    screen_size: tuple[int, int] = SCREEN_SIZE,
+) -> Vector3:
+    """Convert a screen cursor into a normalized camera-space aiming direction."""
+
+    _, forward, right, up = camera.basis(target)
+    focal_length = (screen_size[0] * 0.5) / math.tan(math.radians(FOV_DEGREES) * 0.5)
+    x = (float(cursor[0]) - screen_size[0] * 0.5) / focal_length
+    y = (float(cursor[1]) - screen_size[1] * 0.5) / focal_length
+    direction = forward + right * x - up * y
+    if direction.length_squared() == 0:
+        return forward
+    return direction.normalize()
+
+
+def weapon_muzzle_position(session: SessionState, direction: Vector3 | None = None) -> Vector3:
+    """Return a visual muzzle position beside the player without affecting collision."""
+
+    target = session.player.position + session.camera.target_offset
+    _, forward, right, up = session.camera.basis(target)
+    aim = forward if direction is None else Vector3(direction)
+    if aim.length_squared() == 0:
+        aim = forward
+    else:
+        aim.normalize_ip()
+    return session.player.position + up * 0.15 + right * 0.7 + aim * 0.8
+
+
+def swept_aabb_hit(
+    start: Vector3,
+    end: Vector3,
+    box: AABB,
+) -> float | None:
+    """Return the first normalized hit time for a segment swept through an AABB."""
+
+    delta = end - start
+    lower, upper = 0.0, 1.0
+    for axis in "xyz":
+        origin = getattr(start, axis)
+        motion = getattr(delta, axis)
+        minimum = getattr(box.minimum, axis)
+        maximum = getattr(box.maximum, axis)
+        if abs(motion) < 1e-9:
+            if origin < minimum or origin > maximum:
+                return None
+            continue
+        first = (minimum - origin) / motion
+        last = (maximum - origin) / motion
+        if first > last:
+            first, last = last, first
+        lower = max(lower, first)
+        upper = min(upper, last)
+        if lower > upper:
+            return None
+    return lower
+
+
+def nearest_bullet_target(
+    session: SessionState,
+    start: Vector3,
+    end: Vector3,
+) -> tuple[Building, BuildingSegment] | None:
+    """Find the nearest intact active segment intersected by one bullet sweep."""
+
+    best: tuple[float, tuple[Building, BuildingSegment]] | None = None
+    for building, segment in session.world.static_segments():
+        if segment.world_position(building.origin).distance_to(session.player.position) > (
+            BULLET_MAX_DISTANCE + max(segment.size)
+        ):
+            continue
+        hit_time = swept_aabb_hit(start, end, segment.aabb(building.origin))
+        if hit_time is None:
+            continue
+        candidate = (hit_time, (building, segment))
+        if best is None or candidate[0] < best[0]:
+            best = candidate
+    return None if best is None else best[1]
+
+
+def apply_bullet_hit(
+    session: SessionState,
+    building: Building,
+    segment: BuildingSegment | None,
+) -> list[BuildingSegment]:
+    """Apply one hit, preserving 0–9 progress or completing at hit ten."""
+
+    if segment is None or segment.status != INTACT:
+        return []
+    key = stable_segment_key(segment=segment)
+    hits = max(0, min(BULLET_HITS_TO_BREAK - 1, int(session.damage_overrides.get(key, 0))))
+    hits += 1
+    session.hud.target_segment = key
+    session.hud.target_hits = hits
+    session.add_effect(
+        "HIT",
+        segment.world_position(building.origin),
+        lifetime=8,
+        intensity=1.0,
+        source_segment_id=key,
+    )
+    if hits < BULLET_HITS_TO_BREAK:
+        session.damage_overrides[key] = hits
+        segment.bullet_hits = hits
+        return []
+
+    session.hud.target_hits = BULLET_HITS_TO_BREAK
+    session.hud.completion_feedback_frames = 1
+    session.damage_overrides.pop(key, None)
+    segment.bullet_hits = 0
+    return demolish_segment(session, building, segment, cause="bullet")
+
+
+def _bullet_is_outside_screen(
+    session: SessionState,
+    position: Vector3,
+    screen_size: tuple[int, int],
+) -> bool:
+    target = session.player.position + session.camera.target_offset
+    projected = project_point(position, session.camera, target, screen_size)
+    if projected is None:
+        return True
+    margin = 32.0
+    return (
+        projected[0] < -margin
+        or projected[0] > screen_size[0] + margin
+        or projected[1] < -margin
+        or projected[1] > screen_size[1] + margin
+    )
+
+
+def update_bullets(
+    session: SessionState,
+    screen_size: tuple[int, int] | None = None,
+) -> list[BuildingSegment]:
+    """Move bullets, perform one swept hit each, and remove expired projectiles."""
+
+    screen_size = session.screen_size if screen_size is None else screen_size
+    changed: list[BuildingSegment] = []
+    active: list[Bullet] = []
+    for bullet in session.bullets:
+        if not bullet.active:
+            continue
+        start = Vector3(bullet.position)
+        step = Vector3(bullet.velocity)
+        bullet.position += step
+        bullet.distance_travelled += step.length()
+        bullet.remaining_frames = max(0, bullet.remaining_frames - 1)
+        target = nearest_bullet_target(session, start, bullet.position)
+        if target is not None:
+            changed.extend(apply_bullet_hit(session, target[0], target[1]))
+            continue
+        if not bullet.active or _bullet_is_outside_screen(session, bullet.position, screen_size):
+            continue
+        active.append(bullet)
+    session.bullets[:] = active[-MAX_BULLETS:]
+    return changed
+
+
+def fire_bullet(
+    session: SessionState,
+    screen_size: tuple[int, int] | None = None,
+) -> Bullet | None:
+    """Spawn one visible bullet when the equipped left-button mode permits it."""
+
+    if not session.player.has_gun or not session.player.gun_equipped:
+        return None
+    if session.camera.orbiting:
+        return None
+    screen_size = session.screen_size if screen_size is None else screen_size
+    session.screen_size = screen_size
+    target = session.player.position + session.camera.target_offset
+    direction = aim_direction_from_cursor(
+        session.camera,
+        target,
+        session.cursor_position,
+        screen_size,
+    )
+    bullet = Bullet(weapon_muzzle_position(session, direction), direction * BULLET_SPEED)
+    session.add_bullet(bullet)
+    session.player.fire_cooldown_frames = FIRE_INTERVAL_FRAMES
+    session.add_effect("MUZZLE", bullet.position, lifetime=3, intensity=0.8)
+    return bullet
+
+
+def _pull_target(session: SessionState) -> tuple[Building, BuildingSegment] | None:
+    if session.pull_action is None:
+        return None
+    found = session.world.find_segment(session.pull_action.segment_id)
+    if found is None or found[1].status != INTACT:
+        return None
+    return found
+
+
+def begin_pull(session: SessionState, screen_size: tuple[int, int] | None = None) -> PullAction | None:
+    """Lock the nearest active visible segment at the beginning of a holstered drag."""
+
+    if session.player.gun_equipped or session.camera.orbiting:
+        return None
+    screen_size = session.screen_size if screen_size is None else screen_size
+    session.screen_size = screen_size
+    target = session.player.position + session.camera.target_offset
+    context = projection_context(session.camera, target, screen_size)
+    picked = pick_nearest_segment(
+        session.cursor_position,
+        session.camera,
+        target,
+        session.player.position,
+        session.world.static_segments(),
+        screen_size,
+        context=context,
+    )
+    if picked is None:
+        session.pull_action = None
+        return None
+    _, segment = picked
+    outward = session.camera.position(target) - segment.world_position(picked[0].origin)
+    if outward.length_squared() == 0:
+        outward = Vector3(0, 0, -1)
+    else:
+        outward.normalize_ip()
+    session.pull_action = PullAction(
+        segment_id=segment.segment_id,
+        start_cursor=session.cursor_position,
+        current_cursor=session.cursor_position,
+        offset_direction=outward,
+    )
+    return session.pull_action
+
+
+def release_pull(session: SessionState) -> None:
+    """Cancel a short drag or promote a threshold-reaching drag to animation."""
+
+    action = session.pull_action
+    if action is None or action.phase != PULL_DRAGGING:
+        return
+    if _pull_target(session) is None:
+        session.pull_action = None
+        return
+    action.current_cursor = session.cursor_position
+    action.drag_distance = math.hypot(
+        action.current_cursor[0] - action.start_cursor[0],
+        action.current_cursor[1] - action.start_cursor[1],
+    )
+    if action.drag_distance < PULL_TRIGGER_PIXELS:
+        session.pull_action = None
+        return
+    action.phase = PULL_ANIMATING
+    action.remaining_frames = PULL_ANIMATION_FRAMES
+    action.progress = 0.0
+
+
+def update_pull(session: SessionState) -> list[BuildingSegment]:
+    """Advance a locked pull gesture and commit demolition exactly once."""
+
+    action = session.pull_action
+    if action is None:
+        return []
+    if session.player.gun_equipped or session.camera.orbiting or _pull_target(session) is None:
+        session.pull_action = None
+        return []
+    if action.phase == PULL_DRAGGING:
+        if 1 not in session.held_mouse_buttons:
+            session.pull_action = None
+            return []
+        action.current_cursor = session.cursor_position
+        action.drag_distance = math.hypot(
+            action.current_cursor[0] - action.start_cursor[0],
+            action.current_cursor[1] - action.start_cursor[1],
+        )
+        action.progress = max(0.0, min(1.0, action.drag_distance / PULL_TRIGGER_PIXELS))
+        return []
+    if action.remaining_frames is None:
+        session.pull_action = None
+        return []
+    action.remaining_frames = max(0, action.remaining_frames - 1)
+    action.progress = max(
+        0.0,
+        min(1.0, 1.0 - action.remaining_frames / PULL_ANIMATION_FRAMES),
+    )
+    if action.remaining_frames > 0:
+        return []
+    target = _pull_target(session)
+    session.pull_action = None
+    if target is None:
+        return []
+    return demolish_segment(session, target[0], target[1], cause="pull")
+
+
+def pull_mouse_world_offset(
+    session: SessionState,
+    world_position: Vector3,
+    start_cursor: tuple[int, int],
+    current_cursor: tuple[int, int],
+    screen_size: tuple[int, int] | None = None,
+) -> Vector3:
+    """Convert a cursor drag into a same-depth, screen-following world offset."""
+
+    screen_size = session.screen_size if screen_size is None else screen_size
+    target = session.player.position + session.camera.target_offset
+    context = projection_context(session.camera, target, screen_size)
+    depth = (world_position - context.camera_position).dot(context.forward)
+    if depth <= NEAR_PLANE:
+        return Vector3()
+    delta_x = float(current_cursor[0] - start_cursor[0])
+    delta_y = float(current_cursor[1] - start_cursor[1])
+    return (
+        context.right * (delta_x * depth / context.focal_length)
+        - context.up * (delta_y * depth / context.focal_length)
+    )
+
+
+def pull_render_offset(
+    session: SessionState,
+    segment_id: tuple[object, ...],
+    screen_size: tuple[int, int] | None = None,
+) -> Vector3:
+    """Return a visual-only offset that follows the current mouse drag."""
+
+    action = session.pull_action
+    if action is None or action.segment_id != segment_id:
+        return Vector3()
+    target = _pull_target(session)
+    if target is None:
+        return Vector3()
+    building, segment = target
+    return pull_mouse_world_offset(
+        session,
+        segment.world_position(building.origin),
+        action.start_cursor,
+        action.current_cursor,
+        screen_size,
+    )
 
 
 def pick_nearest_segment(
@@ -1344,19 +1915,44 @@ def _contacting_segment_entries(
     ]
 
 
+def nearby_static_collision_entries(
+    session: SessionState,
+) -> list[tuple[Building, BuildingSegment, AABB]]:
+    """Build a conservative local collision set around the player.
+
+    Collision resolution only needs buildings that can overlap the player's
+    horizontal footprint during the next fixed step.  The radial broad phase
+    keeps all such buildings while avoiding rebuilding AABBs for the entire
+    active world every frame.
+    """
+
+    player = session.player
+    max_horizontal_step = PLAYER_SPEED + max(
+        abs(player.pending_push.x), abs(player.pending_push.z)
+    )
+    entries: list[tuple[Building, BuildingSegment, AABB]] = []
+    for building in session.world.all_buildings():
+        reach_x = building.width * 0.5 + player.size.x * 0.5 + max_horizontal_step
+        reach_z = building.depth * 0.5 + player.size.z * 0.5 + max_horizontal_step
+        if building.distance_to_xz(player.position) > math.hypot(reach_x, reach_z):
+            continue
+        for segment in building.all_segments():
+            if segment.status == INTACT:
+                entries.append((building, segment, segment.aabb(building.origin)))
+    return entries
+
+
 def update_gameplay(
     session: SessionState,
     movement: Vector3,
     jump_requested: bool = False,
 ) -> list[BuildingSegment]:
-    """Run one fixed update, including streaming, player collision and contact demolition."""
+    """Run one fixed update without allowing player contact to demolish buildings."""
 
     session.advance_frame()
     session.world.ensure_active(session.player.position, session.frame)
-    static_entries = [
-        (building, segment, segment.aabb(building.origin))
-        for building, segment in session.world.static_segments()
-    ]
+    was_below_recovery = session.player.position.y < RECOVERY_HEIGHT
+    static_entries = nearby_static_collision_entries(session)
     update_player(
         session.player,
         movement,
@@ -1364,19 +1960,19 @@ def update_gameplay(
         session.frame,
         jump_requested,
     )
+    if was_below_recovery:
+        respawn_player(session)
     changed: list[BuildingSegment] = []
-    for building, segment in _contacting_segment_entries(
-        session.player.aabb(), static_entries
-    ):
-        changed.extend(
-            demolish_segment(
-                session,
-                building,
-                segment,
-                cause="contact",
-                player=session.player,
-            )
-        )
+    if session.player.gun_equipped:
+        if (
+            1 in session.held_mouse_buttons
+            and not session.camera.orbiting
+            and session.player.fire_cooldown_frames <= 0
+        ):
+            fire_bullet(session)
+    else:
+        changed.extend(update_pull(session))
+    changed.extend(update_bullets(session))
     update_debris(session)
     update_respawns(session)
     return changed
@@ -1387,8 +1983,11 @@ def handle_game_event(
     event: pygame.event.Event,
     screen_size: tuple[int, int] = SCREEN_SIZE,
 ) -> None:
-    """Apply window, orbit and left-click demolition events before the update stage."""
+    """Apply input events before the fixed update stage."""
 
+    session.screen_size = screen_size
+    if hasattr(event, "pos"):
+        session.cursor_position = tuple(event.pos)
     if event.type == pygame.QUIT:
         session.running = False
         session.clear_input_state()
@@ -1397,30 +1996,39 @@ def handle_game_event(
         if event.key == pygame.K_ESCAPE:
             session.running = False
             session.clear_input_state()
+        elif event.key == pygame.K_1 and session.player.has_gun:
+            session.player.gun_equipped = not session.player.gun_equipped
+            session.pull_action = None
+            session.player.fire_cooldown_frames = 0
+            session.held_mouse_buttons.discard(1)
     elif event.type == pygame.KEYUP:
         session.held_keys.discard(event.key)
     elif event.type == pygame.WINDOWFOCUSLOST:
         session.clear_input_state()
     elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+        session.held_mouse_buttons.add(3)
         session.camera.orbiting = True
+        session.pull_action = None
+        session.player.fire_cooldown_frames = 0
+        session.held_mouse_buttons.discard(1)
     elif event.type == pygame.MOUSEBUTTONUP and event.button == 3:
+        session.held_mouse_buttons.discard(3)
         session.camera.orbiting = False
     elif event.type == pygame.MOUSEMOTION and session.camera.orbiting:
         session.camera.orbit(*event.rel)
     elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
         if session.camera.orbiting:
             return
-        target = session.player.position + session.camera.target_offset
-        picked = pick_nearest_segment(
-            event.pos,
-            session.camera,
-            target,
-            session.player.position,
-            session.world.static_segments(),
-            screen_size,
-        )
-        if picked is not None:
-            demolish_segment(session, picked[0], picked[1], cause="click")
+        session.held_mouse_buttons.add(1)
+        if session.player.gun_equipped:
+            if session.player.fire_cooldown_frames <= 0:
+                fire_bullet(session, screen_size)
+        else:
+            begin_pull(session, screen_size)
+    elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+        session.held_mouse_buttons.discard(1)
+        if not session.player.gun_equipped:
+            release_pull(session)
 
 
 def create_render_surface(size: tuple[int, int] = SCREEN_SIZE) -> pygame.Surface:
@@ -1432,7 +2040,7 @@ def create_render_surface(size: tuple[int, int] = SCREEN_SIZE) -> pygame.Surface
 def render_basic_scene(surface: pygame.Surface, session: SessionState) -> None:
     """Render the foundation scene used by the first playable checkpoint."""
 
-    surface.fill((8, 10, 24))
+    surface.fill(SKY_COLOR)
     target = session.player.position + session.camera.target_offset
     context = projection_context(session.camera, target, surface.get_size())
     ground = Cuboid(Vector3(0, -0.12, 0), Vector3(160, 0.24, 160))
@@ -1454,9 +2062,9 @@ def render_world(
     session: SessionState,
     highlighted_segment_id: tuple[object, ...] | None = None,
 ) -> None:
-    """Render the bounded active city, then the avatar and dynamic feedback."""
+    """Render active details plus bounded render-only distant silhouettes."""
 
-    surface.fill((8, 10, 24))
+    surface.fill(SKY_COLOR)
     target = (
         session.player.position
         + session.camera.target_offset
@@ -1472,11 +2080,15 @@ def render_world(
     camera_position = session.camera.position(target)
     detailed: list[tuple[float, Building, BuildingSegment]] = []
     renderables: list[tuple[float, Cuboid, tuple[int, int, int], bool]] = []
-    for building in session.world.all_buildings():
+    silhouette_candidates: list[
+        tuple[float, Cuboid, tuple[int, int, int], bool]
+    ] = []
+    for building in session.world.visible_buildings():
+        active_building = session.world.is_active_building(building)
         building_distance = (building.origin - camera_position).length_squared()
         if building_distance > RENDER_DISTANCE**2:
             continue
-        if building_distance <= DETAIL_RENDER_DISTANCE**2:
+        if active_building and building_distance <= DETAIL_RENDER_DISTANCE**2:
             for segment in building.all_segments():
                 if segment.status != INTACT:
                     continue
@@ -1492,7 +2104,7 @@ def render_world(
             continue
         # Distant buildings use one silhouette cuboid; selectable ranges stay
         # in the detailed band, keeping the software renderer responsive.
-        renderables.append(
+        silhouette_candidates.append(
             (
                 building_distance,
                 Cuboid(
@@ -1512,6 +2124,9 @@ def render_world(
             )
         )
 
+    renderables.extend(
+        sorted(silhouette_candidates, key=lambda item: item[0])[:MAX_RENDER_SILHOUETTES]
+    )
     detailed.sort(key=lambda item: item[0])
     selected = detailed[:MAX_RENDER_SEGMENTS]
     if highlighted_segment_id is not None and not any(
@@ -1531,7 +2146,11 @@ def render_world(
     renderables.extend(
         (
             distance,
-            segment.cuboid(building.origin),
+            Cuboid(
+                segment.world_position(building.origin)
+                + pull_render_offset(session, segment.segment_id, surface.get_size()),
+                segment.size,
+            ),
             building.color,
             segment.segment_id == highlighted_segment_id,
         )
@@ -1570,8 +2189,61 @@ def render_world(
         highlighted=True,
         context=context,
     )
+    render_bullets(surface, session, context=context)
+    render_gun(surface, session, context=context)
     draw_effects(surface, session, context=context)
     draw_hud(surface, session)
+
+
+def render_bullets(
+    surface: pygame.Surface,
+    session: SessionState,
+    context: ProjectionContext | None = None,
+) -> None:
+    """Draw active projectiles as small high-contrast screen-space markers."""
+
+    target = session.player.position + session.camera.target_offset
+    context = context or projection_context(session.camera, target, surface.get_size())
+    for bullet in session.bullets:
+        projected = _project_point_with_context(bullet.position, context)
+        if projected is None:
+            continue
+        radius = max(2, min(7, int(10.0 / max(1.0, projected[2] * 0.08))))
+        pygame.draw.circle(
+            surface,
+            (255, 248, 120),
+            (round(projected[0]), round(projected[1])),
+            radius,
+        )
+
+
+def render_gun(
+    surface: pygame.Surface,
+    session: SessionState,
+    context: ProjectionContext | None = None,
+) -> None:
+    """Draw a procedural side-mounted gun only while the player is equipped."""
+
+    if not session.player.has_gun or not session.player.gun_equipped:
+        return
+    target = session.player.position + session.camera.target_offset
+    context = context or projection_context(session.camera, target, surface.get_size())
+    direction = aim_direction_from_cursor(
+        session.camera,
+        target,
+        session.cursor_position,
+        surface.get_size(),
+    )
+    muzzle = weapon_muzzle_position(session, direction)
+    draw_cuboid(
+        surface,
+        Cuboid(muzzle - direction * 0.32, Vector3(0.3, 0.3, 0.75)),
+        session.camera,
+        target,
+        (55, 65, 80),
+        highlighted=True,
+        context=context,
+    )
 
 
 def update_hud(
@@ -1580,10 +2252,16 @@ def update_hud(
     screen_size: tuple[int, int] = SCREEN_SIZE,
     refresh_target: bool = True,
 ) -> tuple[Building, BuildingSegment] | None:
-    """Derive target and nearest respawn information for the HUD."""
+    """Derive weapon mode, active target progress and respawn information."""
 
+    session.cursor_position = tuple(cursor)
+    session.screen_size = screen_size
+    session.hud.weapon_state = "EQUIPPED" if session.player.gun_equipped else "HOLSTERED"
+    session.hud.mode_hint = (
+        "LMB hold to fire" if session.player.gun_equipped else "LMB drag to pull"
+    )
     picked: tuple[Building, BuildingSegment] | None = None
-    if refresh_target:
+    if refresh_target and session.hud.completion_feedback_frames <= 0:
         target = session.player.position + session.camera.target_offset
         context = projection_context(session.camera, target, screen_size)
         picked = pick_nearest_segment(
@@ -1595,7 +2273,18 @@ def update_hud(
             screen_size,
             context=context,
         )
-        session.hud.target_segment = None if picked is None else picked[1].segment_id
+        if picked is None:
+            session.hud.target_segment = None
+            session.hud.target_hits = None
+        else:
+            session.hud.target_segment = picked[1].segment_id
+            session.hud.target_hits = max(
+                0,
+                min(
+                    BULLET_HITS_TO_BREAK - 1,
+                    int(session.damage_overrides.get(picked[1].segment_id, 0)),
+                ),
+            )
     session.hud.destroyed_count = session.destroyed_count
     remaining = [
         max(0, record.respawn_frame - session.frame)
@@ -1618,7 +2307,7 @@ def draw_effects(
     target = session.player.position + session.camera.target_offset
     context = context or projection_context(session.camera, target, surface.get_size())
     for effect in session.effects:
-        if effect.kind != "FLASH":
+        if effect.kind not in ("FLASH", "HIT", "MUZZLE"):
             if effect.kind != "PARTICLE":
                 continue
             phase = effect.effect_id + effect.remaining_frames * 0.7
@@ -1641,10 +2330,18 @@ def draw_effects(
                 radius,
             )
             continue
-        radius = max(4, int(18 * effect.intensity * effect.remaining_frames / 12))
+        if effect.kind == "HIT":
+            radius = max(3, int(10 * effect.intensity * effect.remaining_frames / 8))
+            color = (255, 255, 180)
+        elif effect.kind == "MUZZLE":
+            radius = max(3, int(14 * effect.intensity * effect.remaining_frames / 3))
+            color = (255, 230, 120)
+        else:
+            radius = max(4, int(18 * effect.intensity * effect.remaining_frames / 12))
+            color = (255, 240, 150)
         pygame.draw.circle(
             surface,
-            (255, 240, 150),
+            color,
             (round(projected[0]), round(projected[1])),
             radius,
             2,
@@ -1669,23 +2366,29 @@ def camera_shake_offset(session: SessionState) -> Vector3:
 
 
 def draw_hud(surface: pygame.Surface, session: SessionState) -> None:
-    """Draw count, target, respawn countdown and the fixed controls hint."""
+    """Draw weapon mode, target progress, demolition count and respawn status."""
 
-    if not pygame.font.get_init():
-        pygame.font.init()
-    font = pygame.font.Font(None, 24)
-    title_font = pygame.font.Font(None, 32)
     width, height = surface.get_size()
-    panel = pygame.Surface((width, 86), pygame.SRCALPHA)
+    panel = pygame.Surface((width, 116), pygame.SRCALPHA)
     panel.fill((4, 8, 20, 205))
     surface.blit(panel, (0, 0))
-    title = title_font.render("NEON CITY", True, (90, 240, 255))
-    count = font.render(
-        f"Unique demolished: {session.hud.destroyed_count}", True, (235, 245, 255)
+    title = _hud_text(32, "NEON CITY", (90, 240, 255))
+    count = _hud_text(
+        24,
+        f"Unique demolished: {session.hud.destroyed_count}",
+        (235, 245, 255),
     )
-    target = font.render(
-        "Target: " + ("ready" if session.hud.target_segment is not None else "none"),
-        True,
+    weapon_color = (170, 255, 200) if session.hud.weapon_state == "EQUIPPED" else (235, 245, 255)
+    weapon = _hud_text(
+        24,
+        f"Weapon: {session.hud.weapon_state}  {session.hud.mode_hint}",
+        weapon_color,
+    )
+    target_name = "none" if session.hud.target_segment is None else str(session.hud.target_segment)
+    target_hits = "--" if session.hud.target_hits is None else str(session.hud.target_hits)
+    target = _hud_text(
+        24,
+        f"Target: {target_name}  Hits: {target_hits}/{BULLET_HITS_TO_BREAK}",
         (255, 220, 120),
     )
     respawn_text = (
@@ -1693,13 +2396,14 @@ def draw_hud(surface: pygame.Surface, session: SessionState) -> None:
         if session.hud.respawn_remaining is None
         else f"Respawn: {session.hud.respawn_remaining}s"
     )
-    respawn = font.render(respawn_text, True, (210, 220, 240))
+    respawn = _hud_text(24, respawn_text, (210, 220, 240))
     surface.blit(title, (16, 8))
     surface.blit(count, (170, 12))
-    surface.blit(target, (16, 42))
-    surface.blit(respawn, (170, 42))
-    hint = font.render(session.hud.control_hint, True, (175, 190, 210))
-    surface.blit(hint, (16, max(0, height - 30)))
+    surface.blit(weapon, (16, 40))
+    surface.blit(target, (16, 66))
+    surface.blit(respawn, (650, 66))
+    hint = _hud_text(24, session.hud.control_hint, (175, 190, 210))
+    surface.blit(hint, (16, max(0, height - 28)))
 
 
 def update_session_core(
@@ -1833,5 +2537,15 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def run_cli(argv: list[str] | None = None) -> int:
+    """Run the command-line entry point without exposing a Ctrl+C traceback."""
+
+    try:
+        return main(argv)
+    except KeyboardInterrupt:
+        pygame.quit()
+        return 130
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_cli())
