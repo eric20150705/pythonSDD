@@ -1,5 +1,14 @@
 <!--
 Sync Impact Report
+- Version change: 1.1.0 → 1.2.0
+- Modified principles: None
+- Added sections: Git Branch Naming and Pull Request Lifecycle under Governance
+- Removed sections: None
+- Follow-up TODOs: None
+-->
+
+<!--
+Sync Impact Report
 - Version change: 1.0.0 → 1.1.0
 - Modified principles:
   - Playable Increment First → Playable Increment First（先完成可玩的最小切片）
@@ -119,6 +128,20 @@ unittest 或其他已存在的測試工具建立自動化檢查。無法執行�
 計畫、任務清單與程式碼檢查 MUST 對照本憲章。若需求與憲章衝突，實作前 MUST
 在相關設計文件中明確記錄衝突、選擇與影響。
 
+### Git Branch Naming and Pull Request Lifecycle
+
+- 使用 Spec-kit 建立的功能分支 MUST 採用 `###-feature-name` 格式：`###` 是三位數
+  功能編號，`feature-name` MUST 是小寫、以連字號分隔的簡短描述，不得包含空白、
+  中文或未說明的特殊字元。例如本功能分支應為 `001-dynamic-demolition-sandbox`。
+- Git 分支名稱 MUST 與對應的 `specs/###-feature-name/` 目錄及規格文件中的
+  `Feature Branch` 欄位完全一致，不得額外加入前綴或後綴。
+- 功能分支 MUST 從預設整合分支建立，功能變更 MUST 透過 Pull Request 合併，
+  不得直接將功能提交推送至預設整合分支。
+- Pull Request MUST 連結或指向對應的 spec、plan 與 tasks 文件，並記錄適用的
+  語法檢查、自動化測試與手動 smoke test 結果；未完成的品質門檻 MUST 明確列出。
+- Pull Request 確認合併成功後，來源分支 MUST 從遠端刪除，並同步從本地刪除；
+  分支清除 MUST 在交付紀錄中確認，避免已合併分支持續被使用。
+
 專案擁有者可依學習目標、技術選擇或維護需求修訂本憲章。每次修訂 MUST 更新
 檔案最上方的 Sync Impact Report、說明變更原因、更新語意版本與 Last Amended
 日期。移除或重新定義核心原則是 MAJOR；新增原則、章節或大幅擴充規範是 MINOR；
@@ -128,4 +151,4 @@ unittest 或其他已存在的測試工具建立自動化檢查。無法執行�
 驗證相關狀態不變量，並記錄任何限制。若某條規則被反覆違反，或已不再支持
 學習目標，必須修訂憲章或在設計文件中提出例外；程式碼不得無聲繞過規則。
 
-**Version**: 1.1.0 | **Ratified**: 2026-08-26 | **Last Amended**: 2026-08-26
+**Version**: 1.2.0 | **Ratified**: 2026-08-26 | **Last Amended**: 2026-08-27
